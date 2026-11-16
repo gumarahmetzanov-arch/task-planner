@@ -1,0 +1,7 @@
+__pycache__/
+*.db
+test.db
+.env
+venv/
+.idea/
+.vscode/

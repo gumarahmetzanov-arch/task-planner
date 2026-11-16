@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Планировщик задач</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; background: #f4f4f4; color: #000; }
+  header { background: #fff; border-bottom: 1px solid #ccc; padding: 10px 20px; display: flex; gap: 12px; align-items: center; }
+  header h1 { font-size: 18px; margin: 0; flex: 1; }
+  main { padding: 20px; }
+  input, select, textarea, button { font: inherit; padding: 6px 8px; border: 1px solid #999; background: #fff; }
+  button { cursor: pointer; }
+  .auth { max-width: 320px; margin: 60px auto; background: #fff; padding: 20px; border: 1px solid #ccc; display: grid; gap: 8px; }
+  .bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .col { background: #e8e8e8; padding: 10px; min-height: 200px; }
+  .col h3 { margin: 0 0 8px; font-size: 15px; }
+  .card { background: #fff; border: 1px solid #bbb; padding: 8px; margin-bottom: 8px; cursor: pointer; }
+  .card small { color: #555; display: block; }
+  .high { border-left: 4px solid #000; } .medium { border-left: 4px solid #888; } .low { border-left: 4px solid #ccc; }
+  dialog { width: 420px; border: 1px solid #000; } dialog form, dialog .body { display: grid; gap: 8px; }
+  .comment { border-top: 1px solid #ddd; padding: 4px 0; font-size: 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Планировщик задач</h1>
+  <span id="who"></span>
+  <button id="logout" class="hidden">Выйти</button>
+</header>
+
+<div id="authView" class="auth">
+  <input id="a_user" placeholder="Имя пользователя или email">
+  <input id="a_email" placeholder="Email (только для регистрации)">
+  <input id="a_pass" type="password" placeholder="Пароль">
+  <button id="btnLogin">Войти</button>
+  <button id="btnReg">Зарегистрироваться</button>
+  <div id="a_err" style="color:#900"></div>
+</div>
+
+<main id="appView" class="hidden">
+  <div class="bar">
+    <select id="projects"></select>
+    <button id="newProject">Новый проект</button>
+    <button id="addMember">Добавить участника</button>
+    <button id="newTask">Новая задача</button>
+    <select id="fAssignee"><option value="">Все исполнители</option></select>
+  </div>
+  <div class="board">
+    <div class="col" data-s="todo"><h3>К выполнению</h3></div>
+    <div class="col" data-s="in_progress"><h3>В работе</h3></div>
+    <div class="col" data-s="done"><h3>Готово</h3></div>
+  </div>
+</main>
+
+<dialog id="dlg"><div class="body" id="dlgBody"></div></dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let token = localStorage.getItem("token"), me = null, project = null, members = [], tasks = [], ws = null;
+
+async function api(path, method = "GET", body, form) {
+  const h = {};
+  if (token) h.Authorization = "Bearer " + token;
+  let b;
+  if (form) { b = new URLSearchParams(form); }
+  else if (body) { h["Content-Type"] = "application/json"; b = JSON.stringify(body); }
+  const r = await fetch("/api" + path, { method, headers: h, body: b });
+  if (r.status === 204) return null;
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "Ошибка запроса");
+  return j;
+}
+
+async function auth(register) {
+  $("#a_err").textContent = "";
+  try {
+    const u = $("#a_user").value, p = $("#a_pass").value;
+    if (register) await api("/auth/register", "POST", { username: u, email: $("#a_email").value, password: p });
+    const t = await api("/auth/login", "POST", null, { username: u, password: p });
+    token = t.access_token; localStorage.setItem("token", token);
+    start();
+  } catch (e) { $("#a_err").textContent = e.message; }
+}
+$("#btnLogin").onclick = () => auth(false);
+$("#btnReg").onclick = () => auth(true);
+$("#logout").onclick = () => { localStorage.removeItem("token"); location.reload(); };
+
+async function start() {
+  try { me = await api("/auth/me"); } catch { localStorage.removeItem("token"); return; }
+  $("#authView").classList.add("hidden"); $("#appView").classList.remove("hidden");
+  $("#logout").classList.remove("hidden"); $("#who").textContent = me.username;
+  await loadProjects();
+}
+
+async function loadProjects(selectId) {
+  const list = await api("/projects");
+  const sel = $("#projects");
+  sel.innerHTML = list.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  if (selectId) sel.value = selectId;
+  if (list.length) await openProject(+sel.value); else { project = null; render(); }
+}
+$("#projects").onchange = e => openProject(+e.target.value);
+
+async function openProject(id) {
+  project = await api("/projects/" + id);
+  members = project.members.map(m => m.user);
+  $("#fAssignee").innerHTML = '<option value="">Все исполнители</option>' +
+    members.map(u => `<option value="${u.id}">${esc(u.username)}</option>`).join("");
+  await loadTasks();
+  connect(id);
+}
+
+async function loadTasks() {
+  const a = $("#fAssignee").value;
+  tasks = await api(`/projects/${project.id}/tasks` + (a ? `?assignee_id=${a}` : ""));
+  render();
+}
+$("#fAssignee").onchange = loadTasks;
+
+function connect(id) {
+  if (ws) ws.close();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/projects/${id}?token=${token}`);
+  ws.onmessage = async e => {
+    const ev = JSON.parse(e.data).event;
+    if (ev.startsWith("member")) project = await api("/projects/" + id), members = project.members.map(m => m.user);
+    loadTasks();
+  };
+}
+
+const uname = id => (members.find(u => u.id === id) || {}).username || "—";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const PR = { low: "низкий", medium: "средний", high: "высокий" };
+
+function render() {
+  document.querySelectorAll(".col").forEach(col => {
+    col.querySelectorAll(".card").forEach(c => c.remove());
+    tasks.filter(t => t.status === col.dataset.s).forEach(t => {
+      const d = document.createElement("div");
+      d.className = "card " + t.priority;
+      d.innerHTML = `<b>${esc(t.title)}</b><small>Исполнитель: ${esc(uname(t.assignee_id))}</small>` +
+        `<small>Приоритет: ${PR[t.priority]}${t.due_date ? " · срок: " + t.due_date : ""}</small>`;
+      d.onclick = () => taskDialog(t);
+      col.appendChild(d);
+    });
+  });
+}
+
+const opts = (arr, sel) => arr.map(([v, l]) => `<option value="${v}" ${v == sel ? "selected" : ""}>${l}</option>`).join("");
+const memberOpts = sel => '<option value="">Не назначен</option>' + opts(members.map(u => [u.id, u.username]), sel);
+
+function taskDialog(t) {
+  const isNew = !t;
+  t = t || { title: "", description: "", status: "todo", priority: "medium", due_date: "", assignee_id: "" };
+  $("#dlgBody").innerHTML = `
+    <input id="t_title" placeholder="Название" value="${esc(t.title)}">
+    <textarea id="t_desc" rows="3" placeholder="Описание">${esc(t.description)}</textarea>
+    <select id="t_status">${opts([["todo","К выполнению"],["in_progress","В работе"],["done","Готово"]], t.status)}</select>
+    <select id="t_prio">${opts([["low","Низкий"],["medium","Средний"],["high","Высокий"]], t.priority)}</select>
+    <input id="t_due" type="date" value="${t.due_date || ""}">
+    <select id="t_ass">${memberOpts(t.assignee_id)}</select>
+    <div style="display:flex;gap:8px">
+      <button id="t_save">Сохранить</button>
+      ${isNew ? "" : '<button id="t_del">Удалить</button>'}
+      <button id="t_close">Закрыть</button>
+    </div>
+    ${isNew ? "" : `<div id="cm">${(t.comments || []).map(c => `<div class="comment"><b>${esc(uname(c.author_id))}:</b> ${esc(c.text)}</div>`).join("")}</div>
+      <input id="t_comment" placeholder="Комментарий"><button id="t_cadd">Отправить</button>`}`;
+  $("#dlg").showModal();
+  $("#t_close").onclick = () => $("#dlg").close();
+  $("#t_save").onclick = async () => {
+    const body = {
+      title: $("#t_title").value, description: $("#t_desc").value, status: $("#t_status").value,
+      priority: $("#t_prio").value, due_date: $("#t_due").value || null,
+      assignee_id: $("#t_ass").value ? +$("#t_ass").value : null,
+    };
+    try {
+      await (isNew ? api(`/projects/${project.id}/tasks`, "POST", body) : api("/tasks/" + t.id, "PATCH", body));
+      $("#dlg").close(); loadTasks();
+    } catch (e) { alert(e.message); }
+  };
+  if (!isNew) {
+    $("#t_del").onclick = async () => { await api("/tasks/" + t.id, "DELETE"); $("#dlg").close(); loadTasks(); };
+    $("#t_cadd").onclick = async () => {
+      const text = $("#t_comment").value.trim(); if (!text) return;
+      await api(`/tasks/${t.id}/comments`, "POST", { text });
+      await loadTasks(); taskDialog(tasks.find(x => x.id === t.id));
+    };
+  }
+}
+
+$("#newTask").onclick = () => project && taskDialog(null);
+$("#newProject").onclick = async () => {
+  const name = prompt("Название проекта:"); if (!name) return;
+  const p = await api("/projects", "POST", { name }); loadProjects(p.id);
+};
+$("#addMember").onclick = async () => {
+  if (!project) return;
+  const email = prompt("Email участника:"); if (!email) return;
+  try { await api(`/projects/${project.id}/members`, "POST", { email }); openProject(project.id); }
+  catch (e) { alert(e.message); }
+};
+
+if (token) start();
+</script>
+</body>
+</html>
